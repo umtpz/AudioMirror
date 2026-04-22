@@ -1,5 +1,0 @@
-pyaudiowpatch
-customtkinter
-numpy
-pystray
-pillow
