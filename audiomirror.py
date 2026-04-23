@@ -169,6 +169,7 @@ class AudioEngine:
         self._pa = None
         self._stream_in = None
         self.sinks: list[OutputSink] = []
+        self.viz_callback = None  # fn(rms_per_band: list[float])
 
     def get_loopback_devices(self):
         pa = pyaudio.PyAudio()
@@ -224,6 +225,7 @@ class AudioEngine:
             sink.start(self._pa, cfg["dst_idx"], dst_rate, src_rate, dst_channels, chunk)
             self.sinks.append(sink)
 
+        _VIZ_BANDS = 20
         def callback_in(in_data, frame_count, time_info, status):
             if not self.running:
                 return (None, pyaudio.paComplete)
@@ -231,6 +233,15 @@ class AudioEngine:
             base   = raw[:, :2].copy()
             for sink in self.sinks:
                 sink.push(base)
+            # Feed visualizer
+            if self.viz_callback is not None:
+                mono = base.mean(axis=1)
+                fft  = np.abs(np.fft.rfft(mono * np.hanning(len(mono))))
+                fft  = fft[:len(fft)//2]  # only positive freqs up to ~Nyquist/2
+                band_size = max(1, len(fft) // _VIZ_BANDS)
+                bands = [float(np.mean(fft[i*band_size:(i+1)*band_size]))
+                         for i in range(_VIZ_BANDS)]
+                self.viz_callback(bands)
             return (None, pyaudio.paContinue)
 
         self._stream_in = self._pa.open(
@@ -394,7 +405,11 @@ class OutputChannel(ctk.CTkFrame):
             "latency": int(self.lat_slider.get()),
         }
 
+    def get_device(self):
+        return self.combo.get()
+
     def set_dst_names(self, names):
+        """Set the full available device list (called on refresh)."""
         cur = self.combo.get()
         self.combo.configure(values=names or ["No devices found"])
         if cur in names:
@@ -402,13 +417,22 @@ class OutputChannel(ctk.CTkFrame):
         elif names:
             self.combo.set(names[0])
 
+    def set_available_names(self, names):
+        """Update combo values without changing selection (used for dedup filtering)."""
+        cur = self.combo.get()
+        available = names if names else ["No devices found"]
+        self.combo.configure(values=available)
+        # Keep current selection even if it's been removed from the filtered list
+        # (it's still 'taken' by this channel)
+        self.combo.set(cur)
+
 
 # ── Main App ──────────────────────────────────────────────────────────────────
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("AudioMirror")
-        self.geometry("860x532")
+        self.geometry("860x648")
         self.resizable(False, False)
         self.configure(fg_color=BG)
 
@@ -421,7 +445,7 @@ class App(ctk.CTk):
         self._build_ui()
         self._refresh(silent=True)
         self.after(100, self._apply_height)
-        self.after(100, self._update_out3_state)
+        self.after(100, self._update_optional_states)
         self._try_autostart()
 
         self.protocol("WM_DELETE_WINDOW", self._quit)
@@ -519,10 +543,29 @@ class App(ctk.CTk):
         self.status_lbl = self._lbl(sr, "Stopped", size=12, color=SUBT)
         self.status_lbl.pack(side="left", padx=(8, 0))
 
+        # Visualizer
+        viz_frame = self._card(left)
+        viz_frame.pack(fill="x", pady=(0, 8))
+        viz_header = ctk.CTkFrame(viz_frame, fg_color="transparent")
+        viz_header.pack(fill="x", padx=12, pady=(6, 0))
+        self._lbl(viz_header, "SOURCE MONITOR", color=SUBT).pack(side="left")
+        self._viz_active_lbl = self._lbl(viz_header, "—", size=10, color=SUBT)
+        self._viz_active_lbl.pack(side="right")
+
+        import tkinter as tk
+        self._viz_canvas = tk.Canvas(viz_frame, height=84, bg=CARD2,
+                                     highlightthickness=0, bd=0)
+        self._viz_canvas.pack(fill="x", padx=6, pady=(4, 8))
+        self._viz_bands = 20
+        self._viz_levels = [0.0] * self._viz_bands
+        self._viz_peaks  = [0.0] * self._viz_bands
+        self._viz_canvas.bind("<Configure>", lambda e: self._viz_draw())
+        self.after(50, self._viz_tick)
+
         # Log
         lf = self._card(left)
         lf.pack(fill="x", pady=(0, 8))
-        self.log_box = ctk.CTkTextbox(lf, height=166, fg_color=CARD2, text_color="#606060",
+        self.log_box = ctk.CTkTextbox(lf, height=144, fg_color=CARD2, text_color="#606060",
                                        font=ctk.CTkFont(family="Consolas", size=10),
                                        border_width=0)
         self.log_box.pack(fill="both", expand=True, padx=4, pady=4)
@@ -561,6 +604,7 @@ class App(ctk.CTk):
                                    cfg=cfg.get("out1"), optional=False,
                                    save_fn=self._autosave)
         self.out1.pack(fill="x", padx=10, pady=(0, 6))
+        self.out1.combo.configure(command=lambda _: (self._autosave(), self._update_dedup()))
 
         self.out2 = OutputChannel(oc, "Output 2  (optional)", [],
                                    cfg=cfg.get("out2"), optional=True,
@@ -568,37 +612,87 @@ class App(ctk.CTk):
                                    on_enable_cb=self._on_output_enable,
                                    restart_cb=self._hot_restart)
         self.out2.pack(fill="x", padx=10, pady=(0, 6))
+        self.out2.combo.configure(command=lambda _: (self._autosave(), self._update_dedup()))
 
         self.out3 = OutputChannel(oc, "Output 3  (optional)", [],
                                    cfg=cfg.get("out3"), optional=True,
                                    save_fn=self._autosave,
                                    on_enable_cb=self._on_output_enable,
                                    restart_cb=self._hot_restart)
-        self.out3.pack(fill="x", padx=10, pady=(0, 10))
+        self.out3.pack(fill="x", padx=10, pady=(0, 6))
+        self.out3.combo.configure(command=lambda _: (self._autosave(), self._update_dedup()))
+
+        self.out4 = OutputChannel(oc, "Output 4  (optional)", [],
+                                   cfg=cfg.get("out4"), optional=True,
+                                   save_fn=self._autosave,
+                                   on_enable_cb=self._on_output_enable,
+                                   restart_cb=self._hot_restart)
+        self.out4.pack(fill="x", padx=10, pady=(0, 10))
+        self.out4.combo.configure(command=lambda _: (self._autosave(), self._update_dedup()))
+
+        # Hook source combo for dedup
+        self.src_combo.configure(command=lambda _: (self._autosave(), self._update_dedup()))
 
     # ── Output enable logic ───────────────────────────────────────────────────
-    HEIGHT_MAP = {1: 532, 2: 532, 3: 532}  # horizontal layout, height fixed
+    HEIGHT_MAP = {1: 648, 2: 648, 3: 648, 4: 648}  # horizontal layout, height fixed
+
+    def _all_channels(self):
+        return [self.out1, self.out2, self.out3, self.out4]
 
     def _apply_height(self):
-        active = sum(1 for ch in [self.out1, self.out2, self.out3] if ch.is_active())
-        h = self.HEIGHT_MAP.get(active, 702)
+        active = sum(1 for ch in self._all_channels() if ch.is_active())
+        h = self.HEIGHT_MAP.get(active, 648)
         self.geometry(f"860x{h}")
 
     def _on_output_enable(self):
-        # out3 can only be enabled if out2 is enabled
+        # Enforce chain: out3 requires out2, out4 requires out3
         if self.out3.is_active() and not self.out2.is_active():
             self.out3.enabled_var.set(False)
             self.out3._on_enable()
+        if self.out4.is_active() and not self.out3.is_active():
+            self.out4.enabled_var.set(False)
+            self.out4._on_enable()
         self._apply_height()
-        self._update_out3_state()
+        self._update_optional_states()
+        self._update_dedup()
 
-    def _update_out3_state(self):
-        """Disable out3 enable checkbox hover/interaction when out2 is off."""
-        if hasattr(self, "out3") and hasattr(self.out3, "_enable_cb"):
-            if self.out2.is_active():
-                self.out3._enable_cb.configure(state="normal")
-            else:
-                self.out3._enable_cb.configure(state="disabled")
+    def _update_optional_states(self):
+        """Enable/disable optional checkboxes based on chain dependency."""
+        # out2: always available
+        if hasattr(self, "out2") and hasattr(self.out2, "_enable_cb") and self.out2._enable_cb:
+            self.out2._enable_cb.configure(state="normal")
+        # out3: requires out2
+        if hasattr(self, "out3") and hasattr(self.out3, "_enable_cb") and self.out3._enable_cb:
+            self.out3._enable_cb.configure(
+                state="normal" if self.out2.is_active() else "disabled")
+        # out4: requires out3
+        if hasattr(self, "out4") and hasattr(self.out4, "_enable_cb") and self.out4._enable_cb:
+            self.out4._enable_cb.configure(
+                state="normal" if self.out3.is_active() else "disabled")
+
+    def _update_dedup(self):
+        """Filter combo lists so no device can be selected in two places at once.
+        Source loopback is excluded from output lists; selected outputs are
+        excluded from each other's dropdowns (but each channel still shows
+        its own current selection)."""
+        if not hasattr(self, "out1"):
+            return
+        all_dst = [d["name"] for d in self.output_devices]
+        # Source loopback names that overlap with output names should be excluded
+        src_name = self.src_combo.get() if hasattr(self, "src_combo") else ""
+
+        channels = self._all_channels()
+        for i, ch in enumerate(channels):
+            if not ch.is_active():
+                continue
+            # Collect devices taken by other active channels
+            taken = set()
+            for j, other in enumerate(channels):
+                if j != i and other.is_active():
+                    taken.add(other.get_device())
+            # Available = all - taken (own selection is always kept via set_available_names)
+            available = [d for d in all_dst if d not in taken]
+            ch.set_available_names(available)
 
     # ── Hotkey / Reverse All ──────────────────────────────────────────────────
     def _on_beep_vol(self, v):
@@ -608,7 +702,7 @@ class App(ctk.CTk):
 
     def _reverse_all(self):
         # Toggle each active channel independently
-        active = [ch for ch in [self.out1, self.out2, self.out3] if ch.is_active()]
+        active = [ch for ch in self._all_channels() if ch.is_active()]
         if not active:
             return
         for ch in active:
@@ -685,7 +779,7 @@ class App(ctk.CTk):
             self._log(f"Restart error: {e}")
             return
         # Re-wire live controls
-        active_channels = [ch for ch in [self.out1, self.out2, self.out3] if ch.is_active()]
+        active_channels = [ch for ch in self._all_channels() if ch.is_active()]
         for ch, sink in zip(active_channels, self.engine.sinks):
             ch.reverse_var.trace_add("write",
                 lambda *_, s=sink, v=ch.reverse_var: setattr(s, "reverse", v.get()))
@@ -700,6 +794,7 @@ class App(ctk.CTk):
                     ch._lat_lbl.configure(text=f"{int(val)} ms"),
                     ch._save()))
         self._log(f"Restarted → {len(sink_configs)} output(s) active")
+        self.engine.viz_callback = self._on_viz_data
 
     # ── Autosave ──────────────────────────────────────────────────────────────
     def _autosave(self, *_):
@@ -708,6 +803,7 @@ class App(ctk.CTk):
             "out1":        self.out1.get_config(),
             "out2":        self.out2.get_config(),
             "out3":        self.out3.get_config(),
+            "out4":        self.out4.get_config(),
             "hotkey":      self._hotkey_str,
             "beep_volume": getattr(self, "_beep_volume", 0.5),
         })
@@ -730,13 +826,15 @@ class App(ctk.CTk):
         elif src_names:
             self.src_combo.set(src_names[0])
         # restore saved output device selections
-        for key, ch in [("out1", self.out1), ("out2", self.out2), ("out3", self.out3)]:
+        for key, ch in [("out1", self.out1), ("out2", self.out2), ("out3", self.out3), ("out4", self.out4)]:
             saved_dev = cfg.get(key, {}).get("device")
             if saved_dev and saved_dev in dst_names:
                 ch.combo.set(saved_dev)
 
-        for ch in [self.out1, self.out2, self.out3]:
+        for ch in self._all_channels():
             ch.set_dst_names(dst_names)
+
+        self._update_dedup()
 
         if not silent:
             self._log(f"Found {len(self.loopback_devices)} sources, {len(self.output_devices)} outputs.")
@@ -766,7 +864,7 @@ class App(ctk.CTk):
 
     def _build_sink_configs(self):
         configs = []
-        for ch in [self.out1, self.out2, self.out3]:
+        for ch in self._all_channels():
             if not ch.is_active():
                 continue
             c = ch.get_config()
@@ -799,8 +897,11 @@ class App(ctk.CTk):
 
         self._autosave()
 
+        # Wire visualizer
+        self.engine.viz_callback = self._on_viz_data
+
         # Wire live controls
-        active_channels = [ch for ch in [self.out1, self.out2, self.out3] if ch.is_active()]
+        active_channels = [ch for ch in self._all_channels() if ch.is_active()]
         for ch, sink in zip(active_channels, self.engine.sinks):
             ch.reverse_var.trace_add("write",
                 lambda *_, s=sink, v=ch.reverse_var: setattr(s, "reverse", v.get()))
@@ -816,15 +917,21 @@ class App(ctk.CTk):
                     ch._save()))
 
         self._set_ui(True)
+        src_rate = int(src_info.get("defaultSampleRate", 0))
         self._log(f"Started  {self.src_combo.get()}  →  {len(sink_configs)} output(s)")
+        self._log(f"  SRC rate: {src_rate} Hz")
         for i, (cfg, ch) in enumerate(zip(sink_configs, active_channels)):
+            dst_rate = int(cfg["dst_info"].get("defaultSampleRate", 0))
+            match = "✓" if dst_rate == src_rate else "⚠ MISMATCH"
             self._log(f"  Out{i+1}: {ch.combo.get()} | "
                       f"rev={'on' if cfg['reverse'] else 'off'} | "
-                      f"vol={int(cfg['volume']*100)}% | delay={cfg['delay_ms']}ms")
+                      f"vol={int(cfg['volume']*100)}% | delay={cfg['delay_ms']}ms | "
+                      f"rate={dst_rate} Hz {match}")
         self._update_tray()
 
     def _stop(self):
         self.engine.stop()
+        self.engine.viz_callback = None
         self._set_ui(False)
         self._log("Stopped.")
         self._update_tray()
@@ -843,10 +950,67 @@ class App(ctk.CTk):
             text_color="white" if running else SUBT,
             border_color=RED if running else BORDER)
         self.src_combo.configure(state="disabled" if running else "normal")
-        for ch in [self.out1, self.out2, self.out3]:
+        for ch in self._all_channels():
             ch.combo.configure(state="disabled" if running else "normal")
         self.status_dot.configure(text_color=GREEN if running else RED)
         self.status_lbl.configure(text="Running" if running else "Stopped")
+
+    # ── Visualizer ────────────────────────────────────────────────────────────
+    def _on_viz_data(self, bands: list):
+        """Called from audio thread — just store latest levels."""
+        peak = max(bands) if bands else 1e-9
+        norm = [b / peak for b in bands] if peak > 1e-6 else [0.0] * len(bands)
+        self._viz_levels = norm
+
+    def _viz_tick(self):
+        """UI thread: smooth & draw every 50 ms."""
+        alpha = 0.35
+        for i in range(self._viz_bands):
+            target = self._viz_levels[i]
+            self._viz_peaks[i] = max(self._viz_peaks[i] * 0.92, target)
+            self._viz_levels[i] = self._viz_levels[i] * (1 - alpha) + target * alpha
+        self._viz_draw()
+        self.after(50, self._viz_tick)
+
+    def _viz_draw(self):
+        c = self._viz_canvas
+        c.delete("all")
+        try:
+            w = c.winfo_width()
+            h = c.winfo_height()
+        except Exception:
+            return
+        if w < 4 or h < 4:
+            return
+        n = self._viz_bands
+        gap = 2
+        bar_w = max(1, (w - gap * (n + 1)) / n)
+        running = self.engine.running
+        for i in range(n):
+            x0 = gap + i * (bar_w + gap)
+            x1 = x0 + bar_w
+            lvl = self._viz_levels[i] if running else 0.0
+            bar_h = max(2, lvl * (h - 4))
+            y0 = h - 2 - bar_h
+            y1 = h - 2
+            # Gradient colour: blue → cyan based on level
+            r = int(74  + (0   - 74)  * lvl)
+            g = int(144 + (210 - 144) * lvl)
+            b = int(217 + (255 - 217) * lvl)
+            color = f"#{r:02x}{g:02x}{b:02x}"
+            c.create_rectangle(x0, y0, x1, y1, fill=color, outline="")
+            # Peak dot
+            pk = self._viz_peaks[i] if running else 0.0
+            if pk > 0.05:
+                py = h - 2 - pk * (h - 4)
+                c.create_rectangle(x0, py - 1, x1, py + 1, fill="#ffffff", outline="")
+        # Label
+        if not running:
+            c.create_text(w // 2, h // 2, text="not running",
+                          fill="#444444", font=("Consolas", 9))
+        # Update active label
+        src = self.src_combo.get() if running else ""
+        self._viz_active_lbl.configure(text=src[:28] if src else "—")
 
     # ── Log ───────────────────────────────────────────────────────────────────
     def _log(self, msg):

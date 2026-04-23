@@ -91,6 +91,7 @@ No Python installation needed on the target machine:
 ```bash
 pip install pyinstaller
 pyinstaller --onefile --windowed --name AudioMirror audiomirror.py
+python -m PyInstaller --onefile --windowed --name AudioMirror audiomirror.py
 ```
 
 Output: `dist/AudioMirror.exe`
@@ -100,17 +101,15 @@ Output: `dist/AudioMirror.exe`
 ## DIY Surround Sound Setup
 
 What you need:
-- 2 stereo Bluetooth soundbars (or any two stereo output devices)
-- [VB-Cable](https://vb-audio.com/Cable/) (free virtual audio device)
+- 2 stereo soundbars (or any two stereo output devices, bluetooth etc)
 
 Steps:
-1. Install VB-Cable
-2. Set **VB-Cable** as your Windows default audio output
-3. Place one soundbar in front, one behind you
-4. In AudioMirror: Source = VB-Cable, Output 1 = front soundbar, Output 2 = rear soundbar
-5. Enable **Reverse L/R** on the rear soundbar (so left/right match your listening position)
-6. Fine-tune volume and latency per output
-7. Use the Reverse All shortcut to quickly flip front/rear stereo if needed
+1. Choose one default output (for the best route sound to a unused output)
+2. Place one sound device in front, one behind you
+3. In AudioMirror: Source = Selected output, Output 1 = front sound device, Output 2 = rear sound device
+4. Enable **Reverse L/R** on the rear sound device (so left/right match your listening position)
+5. Fine-tune volume and latency per output
+6. Use the Reverse All shortcut to quickly flip front/rear stereo if needed
 
 Result: spatial stereo without a dedicated surround system.
 
